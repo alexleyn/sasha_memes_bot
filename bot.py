@@ -64,9 +64,9 @@ def _base_ydl_opts(output_template: str, use_cookies: bool = True) -> dict:
         "merge_output_format": "mp4",
         "quiet": True,
         "no_warnings": True,
-        # Use Node.js to solve YouTube's n-challenge (required on server IPs).
+        # Use Deno to solve YouTube's n-challenge (required on server IPs).
         # The solver script is downloaded from GitHub once and cached.
-        "js_runtimes": {"node": {}},
+        "js_runtimes": {"deno": {}},
         "remote_components": {"ejs:github"},
     }
     if not use_cookies:

@@ -9,7 +9,7 @@ A Telegram bot that downloads YouTube Shorts and Instagram Reels and sends them 
 - Auto-updates yt-dlp daily without rebuilding the container
 - Cookie-based YouTube authentication to bypass bot detection
 - If cookies expire, retries the download without them and notifies the user in DM
-- Solves YouTube's JS n-challenge via Node.js
+- Solves YouTube's JS n-challenge via Deno
 
 ## Setup
 
@@ -62,7 +62,7 @@ YouTube blocks downloads from server IPs without valid cookies.
 |---|---|
 | `bot.py` | Main bot: handlers, download logic, inline mode |
 | `updater.py` | Background task: updates yt-dlp daily, restarts process if updated |
-| `Dockerfile` | Python 3.13 + ffmpeg + Node.js |
+| `Dockerfile` | Python 3.13 + ffmpeg + Deno |
 | `docker-compose.yml` | Service definition with named volumes for cookies and yt-dlp cache |
 
 ## Volumes
