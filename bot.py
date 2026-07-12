@@ -8,7 +8,6 @@ from pathlib import Path
 
 import yt_dlp
 from updater import auto_update_loop, update_ytdlp
-from cookies_manager import BrowserSession, COOKIES_FILE
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -20,7 +19,6 @@ from telegram import (
 from telegram.ext import (
     Application,
     CommandHandler,
-    ConversationHandler,
     ChosenInlineResultHandler,
     MessageHandler,
     InlineQueryHandler,
@@ -39,12 +37,6 @@ ADMIN_IDS = {
     int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit()
 }
 
-# ConversationHandler states
-_AWAIT_EMAIL, _AWAIT_PASSWORD, _AWAIT_INPUT = range(3)
-
-# Active browser sessions keyed by Telegram user_id
-_sessions: dict[int, BrowserSession] = {}
-
 URL_PATTERN = re.compile(
     r"https?://"
     r"(?:(?:www|m)\.)?"
@@ -52,7 +44,7 @@ URL_PATTERN = re.compile(
     r"(?:youtube\.com/shorts/[\w-]+)"
     r"|(?:youtu\.be/[\w-]+)"
     r"|(?:youtube\.com/watch\?[^\s]*v=[\w-]+)"
-    r"|(?:instagram\.com/(?:reel|p)/[\w-]+)"
+    r"|(?:instagram\.com/(?:reels?|p)/[\w-]+)"
     r"|(?:vm\.tiktok\.com/[\w-]+)"
     r"|(?:tiktok\.com/@[\w.]+/video/\d+)"
     r")"
@@ -65,7 +57,7 @@ MAX_FILE_SIZE_MB = 50  # Telegram Bot API limit
 COOKIES_FILE = os.environ.get("COOKIES_FILE", "/cookies/cookies.txt")
 
 
-def _base_ydl_opts(output_template: str) -> dict:
+def _base_ydl_opts(output_template: str, use_cookies: bool = True) -> dict:
     opts = {
         "format": "bv*[vcodec^=avc1]+ba[ext=m4a]/b[ext=mp4]/b",
         "outtmpl": output_template,
@@ -77,6 +69,8 @@ def _base_ydl_opts(output_template: str) -> dict:
         "js_runtimes": {"node": {}},
         "remote_components": {"ejs:github"},
     }
+    if not use_cookies:
+        return opts
     if os.path.isfile(COOKIES_FILE):
         opts["cookiefile"] = COOKIES_FILE
         logger.info("Using cookies from %s", COOKIES_FILE)
@@ -85,13 +79,23 @@ def _base_ydl_opts(output_template: str) -> dict:
     return opts
 
 
+AUTH_ERROR_MARKERS = ("sign in", "not a bot", "login required", "authentication", "cookies")
+
+
+def _is_auth_error(msg: str) -> bool:
+    m = msg.lower()
+    return any(marker in m for marker in AUTH_ERROR_MARKERS)
+
+
 def extract_url(text: str) -> str | None:
     """Extract first supported video URL from text."""
     match = URL_PATTERN.search(text)
     return match.group(0) if match else None
 
 
-async def download_video(url: str, output_dir: str) -> tuple[str | None, str | None, int | None, int | None]:
+async def download_video(
+    url: str, output_dir: str, use_cookies: bool = True
+) -> tuple[str | None, str | None, int | None, int | None]:
     """
     Download video using yt-dlp, trying format presets in order.
     Returns (file_path, title, width, height) or (None, error_message, None, None).
@@ -108,7 +112,7 @@ async def download_video(url: str, output_dir: str) -> tuple[str | None, str | N
     ]
 
     def _download(fmt: str) -> tuple[str, str, int | None, int | None]:
-        opts = _base_ydl_opts(output_template)
+        opts = _base_ydl_opts(output_template, use_cookies)
         opts["format"] = fmt
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
@@ -161,144 +165,44 @@ async def download_video(url: str, output_dir: str) -> tuple[str | None, str | N
     return filename, title, width, height
 
 
-# ── Browser login (/login ConversationHandler) ────────────────────────────────
+async def download_with_cookie_fallback(
+    url: str, output_dir: str
+) -> tuple[str | None, str | None, int | None, int | None, bool]:
+    """
+    Download with cookies; if that fails with an auth error, retry without them.
+    Returns (file_path, title_or_error, width, height, cookies_expired).
+    """
+    filepath, result, width, height = await download_video(url, output_dir)
+    if (
+        filepath is not None
+        or not os.path.isfile(COOKIES_FILE)
+        or not _is_auth_error(result or "")
+    ):
+        return filepath, result, width, height, False
 
-def _is_admin(user_id: int) -> bool:
-    return not ADMIN_IDS or user_id in ADMIN_IDS
+    logger.warning("Auth error with cookies for %s — retrying without cookies", url)
+    filepath, result, width, height = await download_video(url, output_dir, use_cookies=False)
+    return filepath, result, width, height, True
 
 
-async def _screenshot_reply(update: Update, session: BrowserSession, caption: str) -> None:
-    img = await session.screenshot()
-    await update.message.reply_photo(photo=img, caption=caption)
-
-
-async def login_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    user_id = update.effective_user.id
-    if not _is_admin(user_id):
-        await update.message.reply_text("⛔ Admins only.")
-        return ConversationHandler.END
-
-    # Close any existing session for this user
-    if user_id in _sessions:
-        await _sessions[user_id].close()
-
-    await update.message.reply_text("🌐 Starting browser, please wait...")
-
-    session = BrowserSession()
+async def notify_cookies_expired(bot, user_id: int) -> None:
+    """DM the user that cookies.txt is stale. Best-effort: user may not have started the bot."""
     try:
-        await session.start()
-        await session.goto(
-            "https://accounts.google.com/signin/v2/identifier"
-            "?service=youtube&hl=en"
+        await bot.send_message(
+            chat_id=user_id,
+            text=(
+                "⚠️ YouTube cookies have expired — I retried the download without them.\n"
+                "Please upload a fresh cookies.txt via /setcookies."
+            ),
         )
     except Exception as e:
-        await session.close()
-        await update.message.reply_text(f"❌ Failed to start browser:\n{e}")
-        return ConversationHandler.END
-
-    _sessions[user_id] = session
-    await _screenshot_reply(update, session, "Enter your Google account email:")
-    return _AWAIT_EMAIL
-
-
-async def login_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    user_id = update.effective_user.id
-    session = _sessions.get(user_id)
-    if not session:
-        return ConversationHandler.END
-
-    await session.type_text(update.message.text.strip())
-    await session.press("Enter")
-    await _screenshot_reply(update, session, "Enter your password:")
-    return _AWAIT_PASSWORD
-
-
-async def login_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    user_id = update.effective_user.id
-    session = _sessions.get(user_id)
-    if not session:
-        return ConversationHandler.END
-
-    # Delete message with password for security
-    try:
-        await update.message.delete()
-    except Exception:
-        pass
-
-    await session.type_text(update.message.text.strip())
-    await session.press("Enter")
-
-    # Check if we're past Google auth (login success → redirected away)
-    if "accounts.google.com" not in session.url:
-        return await _finish_login(update, session, user_id)
-
-    await _screenshot_reply(
-        update, session,
-        "Additional verification required.\n\n"
-        "Enter your 2FA code, phone number, or other response.\n"
-        "Or /done to save cookies as-is.\n"
-        "/cancel to abort.",
-    )
-    return _AWAIT_INPUT
-
-
-async def login_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    user_id = update.effective_user.id
-    session = _sessions.get(user_id)
-    if not session:
-        return ConversationHandler.END
-
-    await session.type_text(update.message.text.strip())
-    await session.press("Enter")
-
-    if "accounts.google.com" not in session.url:
-        return await _finish_login(update, session, user_id)
-
-    await _screenshot_reply(
-        update, session,
-        "Enter the next response, /done to save, or /cancel to abort.",
-    )
-    return _AWAIT_INPUT
-
-
-async def login_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    user_id = update.effective_user.id
-    session = _sessions.get(user_id)
-    if not session:
-        await update.message.reply_text("No active session.")
-        return ConversationHandler.END
-    return await _finish_login(update, session, user_id)
-
-
-async def login_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    user_id = update.effective_user.id
-    if user_id in _sessions:
-        await _sessions.pop(user_id).close()
-    await update.message.reply_text("Login cancelled.")
-    return ConversationHandler.END
-
-
-async def _finish_login(
-    update: Update, session: BrowserSession, user_id: int
-) -> int:
-    """Navigate to YouTube, export cookies, close browser, report result."""
-    try:
-        await session.goto("https://www.youtube.com")
-        count = await session.save_cookies()
-        await session.close()
-        _sessions.pop(user_id, None)
-        await update.message.reply_text(
-            f"✅ Done! Saved {count} cookies.\n"
-            "The bot can now download videos from YouTube."
-        )
-    except Exception as e:
-        await session.close()
-        _sessions.pop(user_id, None)
-        await update.message.reply_text(f"❌ Failed to save cookies:\n{e}")
-    return ConversationHandler.END
+        logger.warning("Could not notify user %s about expired cookies: %s", user_id, e)
 
 
 # ── /setcookies — upload cookies.txt directly as a file ──────────────────────
+
+def _is_admin(user_id: int) -> bool:
+    return not ADMIN_IDS or user_id in ADMIN_IDS
 
 async def setcookies_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Admin: upload a cookies.txt file (Netscape format) to the bot."""
@@ -354,7 +258,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     status_msg = await update.message.reply_text("⏳ Downloading...")
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        filepath, result, width, height = await download_video(url, tmpdir)
+        filepath, result, width, height, cookies_expired = await download_with_cookie_fallback(
+            url, tmpdir
+        )
+        if cookies_expired:
+            await notify_cookies_expired(context.bot, update.effective_user.id)
         if filepath is None:
             await status_msg.edit_text(f"❌ {result}")
             return
@@ -426,7 +334,11 @@ async def chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        filepath, res, width, height = await download_video(url, tmpdir)
+        filepath, res, width, height, cookies_expired = await download_with_cookie_fallback(
+            url, tmpdir
+        )
+        if cookies_expired:
+            await notify_cookies_expired(context.bot, user_id)
 
         if filepath is None:
             await context.bot.edit_message_text(
@@ -485,22 +397,6 @@ def main() -> None:
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    login_handler = ConversationHandler(
-        entry_points=[CommandHandler("login", login_start)],
-        states={
-            _AWAIT_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_email)],
-            _AWAIT_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_password)],
-            _AWAIT_INPUT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, login_input),
-                CommandHandler("done", login_done),
-            ],
-        },
-        fallbacks=[CommandHandler("cancel", login_cancel)],
-        per_user=True,
-        per_chat=True,
-    )
-
-    app.add_handler(login_handler)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("setcookies", setcookies_command))
     # Any document sent by an admin is treated as a cookies.txt upload

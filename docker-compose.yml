@@ -5,7 +5,7 @@ services:
     restart: always
     env_file: .env
     volumes:
-      - ytdlp_cache:/home/botuser/.cache/yt-dlp
+      - ytdlp_cache:/root/.cache/yt-dlp
       - cookies:/cookies
     logging:
       driver: json-file
