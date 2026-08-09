@@ -20,6 +20,7 @@ from telegram.ext import (
     Application,
     CommandHandler,
     ChosenInlineResultHandler,
+    Defaults,
     MessageHandler,
     InlineQueryHandler,
     ContextTypes,
@@ -395,7 +396,13 @@ def main() -> None:
             "BOT_TOKEN is not set. Set the BOT_TOKEN environment variable."
         )
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    # Send all messages silently (like Telegram's "Send without sound")
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .defaults(Defaults(disable_notification=True))
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("setcookies", setcookies_command))
