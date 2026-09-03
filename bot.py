@@ -88,6 +88,18 @@ def _is_auth_error(msg: str) -> bool:
     return any(marker in m for marker in AUTH_ERROR_MARKERS)
 
 
+# Transient YouTube/yt-dlp hiccups — retrying the same request shortly after
+# usually succeeds. Not format- or auth-related, so handled separately.
+TRANSIENT_ERROR_MARKERS = ("the page needs to be reloaded", "http error 5", "unable to download webpage")
+TRANSIENT_RETRY_ATTEMPTS = 3
+TRANSIENT_RETRY_DELAY_SECONDS = 2
+
+
+def _is_transient_error(msg: str) -> bool:
+    m = msg.lower()
+    return any(marker in m for marker in TRANSIENT_ERROR_MARKERS)
+
+
 def extract_url(text: str) -> str | None:
     """Extract first supported video URL from text."""
     match = URL_PATTERN.search(text)
@@ -130,15 +142,27 @@ async def download_video(
     last_err = ""
     try:
         for fmt in format_attempts:
-            try:
-                filename, title, width, height = await loop.run_in_executor(None, _download, fmt)
+            # Inner loop always ends via break (success or format unavailable)
+            # or by raising (non-retryable / retries exhausted) — never falls through.
+            for attempt in range(1, TRANSIENT_RETRY_ATTEMPTS + 1):
+                try:
+                    filename, title, width, height = await loop.run_in_executor(None, _download, fmt)
+                    break
+                except yt_dlp.utils.DownloadError as e:
+                    last_err = str(e)
+                    if _is_transient_error(last_err) and attempt < TRANSIENT_RETRY_ATTEMPTS:
+                        logger.warning(
+                            "Transient error on attempt %d/%d for %s, retrying: %s",
+                            attempt, TRANSIENT_RETRY_ATTEMPTS, url, last_err,
+                        )
+                        await asyncio.sleep(TRANSIENT_RETRY_DELAY_SECONDS)
+                        continue
+                    if "requested format is not available" in last_err.lower():
+                        logger.warning("Format %r unavailable, trying fallback", fmt)
+                        break
+                    raise
+            if filename is not None:
                 break
-            except yt_dlp.utils.DownloadError as e:
-                last_err = str(e)
-                if "requested format is not available" in last_err.lower():
-                    logger.warning("Format %r unavailable, trying fallback", fmt)
-                    continue
-                raise
         else:
             raise yt_dlp.utils.DownloadError(last_err)
     except yt_dlp.utils.DownloadError as e:
