@@ -100,6 +100,31 @@ def _is_transient_error(msg: str) -> bool:
     return any(marker in m for marker in TRANSIENT_ERROR_MARKERS)
 
 
+def _probe_dimensions(filename: str) -> tuple[int | None, int | None]:
+    """
+    Read actual width/height from the video file via ffprobe.
+    Used when yt-dlp's metadata omits them (seen on some Instagram formats),
+    which otherwise makes Telegram render a vertical video as square.
+    """
+    import json
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=width,height",
+                "-of", "json", filename,
+            ],
+            capture_output=True, text=True, timeout=15, check=True,
+        ).stdout
+        stream = json.loads(out)["streams"][0]
+        return stream.get("width"), stream.get("height")
+    except Exception as e:
+        logger.warning("ffprobe failed to read dimensions of %s: %s", filename, e)
+        return None, None
+
+
 def extract_url(text: str) -> str | None:
     """Extract first supported video URL from text."""
     match = URL_PATTERN.search(text)
@@ -187,6 +212,14 @@ async def download_video(
     if size_mb > MAX_FILE_SIZE_MB:
         os.remove(filename)
         return None, f"Video is too large ({size_mb:.1f} MB). Telegram limit is {MAX_FILE_SIZE_MB} MB.", None, None
+
+    if width is None or height is None:
+        # Some formats (seen on Instagram) omit dimensions in yt-dlp's metadata.
+        # Without width/height, Telegram falls back to rendering the video as
+        # square regardless of its real aspect ratio, so read them from the file.
+        probed_width, probed_height = await loop.run_in_executor(None, _probe_dimensions, filename)
+        width, height = probed_width or width, probed_height or height
+
     return filename, title, width, height
 
 
