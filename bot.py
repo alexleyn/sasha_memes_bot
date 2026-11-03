@@ -26,6 +26,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+from telegram.request import HTTPXRequest
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -453,11 +454,33 @@ def main() -> None:
             "BOT_TOKEN is not set. Set the BOT_TOKEN environment variable."
         )
 
+    # python-telegram-bot's defaults (5s connect/read/write, 20s for media) assume
+    # a datacenter-grade uplink. On a home connection, uploading a video up to
+    # MAX_FILE_SIZE_MB can take longer and timing/latency is less consistent, so
+    # give every call — especially media uploads — a much more generous budget.
+    # Separate instances: get_updates holds one dedicated long-poll connection,
+    # while general calls (sendVideo, editMessage, ...) need their own pool so a
+    # slow upload can't stall message handling.
+    request = HTTPXRequest(
+        connection_pool_size=8,
+        connect_timeout=15.0,
+        read_timeout=30.0,
+        write_timeout=60.0,
+        media_write_timeout=180.0,
+    )
+    get_updates_request = HTTPXRequest(
+        connect_timeout=15.0,
+        read_timeout=30.0,
+        write_timeout=30.0,
+    )
+
     # Send all messages silently (like Telegram's "Send without sound")
     app = (
         Application.builder()
         .token(BOT_TOKEN)
         .defaults(Defaults(disable_notification=True))
+        .request(request)
+        .get_updates_request(get_updates_request)
         .build()
     )
 
