@@ -461,10 +461,15 @@ def main() -> None:
     # Separate instances: get_updates holds one dedicated long-poll connection,
     # while general calls (sendVideo, editMessage, ...) need their own pool so a
     # slow upload can't stall message handling.
+    #
+    # Note: HTTPXRequest only swaps in media_write_timeout for the *write* phase
+    # when uploading a file — read_timeout still governs the wait for Telegram's
+    # response afterwards, which includes server-side video processing. It needs
+    # as much headroom as the write phase, not the plain-call default.
     request = HTTPXRequest(
         connection_pool_size=8,
         connect_timeout=15.0,
-        read_timeout=30.0,
+        read_timeout=180.0,
         write_timeout=60.0,
         media_write_timeout=180.0,
     )
